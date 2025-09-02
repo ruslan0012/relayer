@@ -1,202 +1,92 @@
-import { utils as sdkUtils } from "@across-protocol/sdk";
+import minimist from "minimist";
 import {
   config,
   delay,
-  disconnectRedisClients,
-  getNetworkName,
-  getRedisCache,
-  Profiler,
-  Signer,
-  winston,
-} from "../utils";
-import { Relayer } from "./Relayer";
-import { RelayerConfig } from "./RelayerConfig";
-import { constructRelayerClients } from "./RelayerClientHelper";
-config();
-let logger: winston.Logger;
+  exit,
+  retrieveSignerFromCLIArgs,
+  help,
+  Logger,
+  usage,
+  waitForLogger,
+  stringifyThrownValue,
+} from "./src/utils";
+import { runRelayer, runRebalancer } from "./src/relayer";
+import { runDataworker } from "./src/dataworker";
+import { runMonitor } from "./src/monitor";
+import { runFinalizer } from "./src/finalizer";
+import { version } from "./package.json";
 
-const ACTIVE_RELAYER_EXPIRY = 600; // 10 minutes.
-const {
-  RUN_IDENTIFIER: runIdentifier,
-  BOT_IDENTIFIER: botIdentifier = "across-relayer",
-  RELAYER_MAX_STARTUP_DELAY = "120",
-} = process.env;
+// Logger flush delay in seconds to ensure all logs are written before exit
+const LOGGER_FLUSH_DELAY_SECONDS = 5;
 
-const maxStartupDelay = Number(RELAYER_MAX_STARTUP_DELAY);
+let logger: typeof Logger;
+let cmd: string;
 
-export async function runRelayer(_logger: winston.Logger, baseSigner: Signer): Promise<void> {
-  const profiler = new Profiler({
-    at: "Relayer#run",
-    logger: _logger,
-  });
+const CMDS = {
+  dataworker: runDataworker,
+  finalizer: runFinalizer,
+  help: help,
+  monitor: runMonitor,
+  relayer: runRelayer,
+  rebalancer: runRebalancer,
+};
 
-  logger = _logger;
-  const config = new RelayerConfig(process.env);
-  const { externalListener, pollingDelay } = config;
+export async function run(args: { [k: string]: boolean | string }): Promise<void> {
+  logger = Logger;
 
-  const loop = pollingDelay > 0;
-  let stop = false;
-  process.on("SIGHUP", () => {
-    logger.debug({
-      at: "Relayer#run",
-      message: "Received SIGHUP, stopping at end of current loop.",
-    });
-    stop = true;
-  });
+  // todo Make the mode of operation an operand, rather than an option.
+  // i.e. ts-node ./index.ts [options] <relayer|...>
+  // Note: ts does not produce a narrow type from Object.keys, so we have to help.
+  cmd = Object.keys(CMDS).find((_cmd) => !!args[_cmd]);
 
-  const redis = await getRedisCache(logger);
-  let activeRelayerUpdated = false;
-
-  // Explicitly don't log addressFilter because it can be huge and can overwhelm log transports.
-  const { addressFilter: _addressFilter, ...loggedConfig } = config;
-  logger.debug({ at: "Relayer#run", message: "Relayer started 🏃‍♂️", loggedConfig });
-  const mark = profiler.start("relayer");
-  const relayerClients = await constructRelayerClients(logger, config, baseSigner);
-  const relayer = new Relayer(await baseSigner.getAddress(), logger, relayerClients, config);
-  await relayer.init();
-
-  const { spokePoolClients, inventoryClient } = relayerClients;
-  const simulate = !config.sendingTransactionsEnabled || !config.sendingRelaysEnabled;
-  let txnReceipts: { [chainId: number]: Promise<string[]> } = {};
-  const inventoryManagement = inventoryClient.isInventoryManagementEnabled();
-  let inventoryInit = false;
-
-  try {
-    for (let run = 1; !stop; ++run) {
-      if (loop) {
-        logger.debug({ at: "relayer#run", message: `Starting relayer execution loop ${run}.` });
-      }
-      const tLoopStart = profiler.start("Relayer execution loop");
-      const ready = await relayer.update();
-      const activeRelayer = redis ? await redis.get(botIdentifier) : undefined;
-
-      // If there is another active relayer, allow up to 120 seconds for this instance to be ready.
-      // If this instance can't update, throw an error (for now).
-      if (!ready && activeRelayer) {
-        if (run * pollingDelay < maxStartupDelay) {
-          const runTime = Math.round((performance.now() - tLoopStart.startTime) / 1000);
-          const delta = pollingDelay - runTime;
-          logger.debug({ at: "Relayer#run", message: `Not ready to relay, waiting ${delta} seconds.` });
-          await delay(delta);
-          continue;
-        }
-
-        const badChains = Object.values(spokePoolClients)
-          .filter(({ isUpdated }) => !isUpdated)
-          .map(({ chainId }) => getNetworkName(chainId));
-        throw new Error(`Unable to start relayer due to chains ${badChains.join(", ")}`);
-      }
-      // Execute bundleRefundsPromise only after all spokePoolClients are updated.
-      if (!inventoryInit && inventoryManagement) {
-        await inventoryClient.executeBundleRefundsPromise();
-        inventoryInit = true;
-      }
-
-      // Signal to any existing relayer that a handover is underway, or alternatively
-      // check for handover initiated by another (newer) relayer instance.
-      if (loop && runIdentifier && redis) {
-        if (activeRelayer !== runIdentifier) {
-          if (!activeRelayerUpdated) {
-            logger.debug({
-              at: "Relayer#run",
-              message: `Taking over from ${botIdentifier} instance ${activeRelayer}.`,
-            });
-            await redis.set(botIdentifier, runIdentifier, ACTIVE_RELAYER_EXPIRY);
-            activeRelayerUpdated = true;
-          } else {
-            logger.debug({ at: "Relayer#run", message: `Handing over to ${botIdentifier} instance ${activeRelayer}.` });
-            stop = true;
-          }
-        }
-      }
-
-      if (!stop) {
-        txnReceipts = await relayer.checkForUnfilledDepositsAndFill(config.sendingSlowRelaysEnabled, simulate);
-        await relayer.runMaintenance();
-      }
-
-      if (!loop) {
-        stop = true;
-      } else {
-        const runTimeMilliseconds = tLoopStart.stop({
-          message: "Completed relayer execution loop.",
-          loopCount: run,
-        });
-        if (!stop) {
-          const runTime = Math.round(runTimeMilliseconds / 1000);
-
-          // When txns are pending submission, yield execution to ensure they can be submitted.
-          const minDelay = Object.values(txnReceipts).length > 0 ? 0.1 : 0;
-          const delta = pollingDelay > runTime ? pollingDelay - runTime : minDelay;
-          logger.debug({
-            at: "relayer#run",
-            message: `Waiting ${delta} s before next loop.`,
-          });
-          await delay(delta);
-        }
-      }
-    }
-
-    // Before exiting, wait for transaction submission to complete.
-    for (const [chainId, submission] of Object.entries(txnReceipts)) {
-      const [result] = await Promise.allSettled([submission]);
-      if (sdkUtils.isPromiseRejected(result)) {
-        logger.warn({
-          at: "Relayer#runRelayer",
-          message: `Failed transaction submission on ${getNetworkName(Number(chainId))}.`,
-          reason: result.reason,
-        });
-      }
-    }
-  } finally {
-    await disconnectRedisClients(logger);
-
-    if (externalListener) {
-      Object.values(spokePoolClients).map((spokePoolClient) => spokePoolClient.stopWorker());
-    }
+  if (cmd === "help") {
+    CMDS[cmd]();
+  } // no return
+  else if (cmd === undefined) {
+    usage("");
+  } // no return
+  else if (typeof args["wallet"] !== "string" || args["wallet"].length === 0) {
+    // todo: Update usage() to provide a hint that wallet is missing/malformed.
+    usage(""); // no return
+  } else {
+    // One global signer for use with a specific per-chain provider.
+    // todo: Support a void signer for monitor mode (only) if no wallet was supplied.
+    const signer = await retrieveSignerFromCLIArgs();
+    await CMDS[cmd](logger, signer);
   }
-
-  mark.stop({ message: "Relayer instance completed." });
 }
 
-export async function runRebalancer(_logger: winston.Logger, baseSigner: Signer): Promise<void> {
-  const personality = "Rebalancer";
-  const at = `${personality}::run`;
+if (require.main === module) {
+  // Inject version into process.env so CommonConfig and all subclasses inherit it.
+  process.env.ACROSS_BOT_VERSION = version;
+  config();
 
-  logger = _logger;
-  const config = new RelayerConfig(process.env);
+  const opts = {
+    boolean: Object.keys(CMDS),
+    string: ["wallet", "keys", "address", "binanceSecretKey"],
+    default: { wallet: "secret" },
+    alias: { h: "help" },
+    unknown: usage,
+  };
 
-  // Explicitly don't log addressFilter because it can be huge and can overwhelm log transports.
-  const { addressFilter: _addressFilter, ...loggedConfig } = config;
-  logger.debug({ at, message: `${personality} started 🏃‍♂️`, loggedConfig });
-  const clients = await constructRelayerClients(logger, config, baseSigner);
+  const args = minimist(process.argv.slice(2), opts);
 
-  const { inventoryClient, tokenClient } = clients;
-  const inventoryManagement = clients.inventoryClient.isInventoryManagementEnabled();
-  if (!inventoryManagement) {
-    logger.debug({ at, message: "Inventory management disabled, nothing to do." });
-    return;
-  }
-
-  const rebalancer = new Relayer(await baseSigner.getAddress(), logger, clients, config);
-
-  try {
-    await rebalancer.init();
-    await rebalancer.update();
-    await rebalancer.checkForUnfilledDepositsAndFill(false, true);
-    await rebalancer.runMaintenance();
-
-    // It's necessary to update token balances in case WETH was wrapped.
-    tokenClient.clearTokenData();
-    await tokenClient.update();
-    if (config.sendingTransactionsEnabled) {
-      await inventoryClient.setTokenApprovals();
-    }
-
-    await inventoryClient.rebalanceInventoryIfNeeded();
-    await inventoryClient.withdrawExcessBalances();
-  } finally {
-    await disconnectRedisClients(logger);
-    logger.debug({ at, message: `${personality} instance completed.` });
-  }
+  let exitCode = 0;
+  run(args)
+    .catch(async (error) => {
+      exitCode = 1;
+      const stringifiedError = stringifyThrownValue(error);
+      logger.error({
+        at: cmd ?? "unknown process",
+        message: "There was an execution error!",
+        error: stringifiedError,
+        args,
+        notificationPath: "across-error",
+      });
+    })
+    .finally(async () => {
+      await waitForLogger(logger);
+      await delay(LOGGER_FLUSH_DELAY_SECONDS); // Wait for logger to flush.
+      exit(exitCode);
+    });
 }
